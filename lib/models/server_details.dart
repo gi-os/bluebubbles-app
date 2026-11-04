@@ -160,6 +160,9 @@ class ServerDetails {
   /// Several attachments in one message (v1.7.0).
   bool get supportsMultiAttachmentSend => _featureCode >= 247;
 
+  /// Read the name and photo someone shared, and share your own with a chat (v1.9.0, Big Sur+).
+  bool get supportsNameSharing => serverVersionCode >= 289 && isMinBigSur;
+
   /// macOS version as a display string, e.g. "14.2".
   String get macOSVersionString => '$macOSVersion.$macOSMinorVersion';
 
