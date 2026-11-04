@@ -156,6 +156,10 @@ class ServerDetails {
   /// Create new group chats via the Private API (v1.8.0).
   bool get supportsCreateGroupChat => _featureCode >= 268;
 
+  /// Several attachments in one message: `attachment/upload` then `message/multipart` with attachment parts.
+  /// Only tried against v2 so far.
+  bool get supportsMultiAttachmentSend => isV2Server;
+
   /// macOS version as a display string, e.g. "14.2".
   String get macOSVersionString => '$macOSVersion.$macOSMinorVersion';
 
