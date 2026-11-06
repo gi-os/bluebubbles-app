@@ -4,7 +4,6 @@ import 'dart:io';
 import 'dart:math';
 
 import 'package:bluebubbles/helpers/backend/settings_helpers.dart';
-import 'package:bluebubbles/utils/crypto_utils.dart';
 import 'package:bluebubbles/utils/logger/logger.dart';
 import 'package:bluebubbles/helpers/helpers.dart';
 import 'package:bluebubbles/services/services.dart';
@@ -76,8 +75,8 @@ class SocketService {
   /// rediscovery is the only recovery from [_socketGaveUp].
   static const Duration _urlDiscoveryTimeout = Duration(seconds: 60);
 
-  /// The server's engine.io heartbeat takes up to three minutes to notice a dead connection
-  /// and can't change until the server rewrite, so the client runs its own.
+  /// 1.x's engine.io heartbeat takes up to three minutes to notice a dead connection, so we run our own.
+  /// v2 drops client-sent socket events, so nothing would ack it there.
   static const Duration _heartbeatInterval = Duration(seconds: 30);
   static const Duration _heartbeatTimeout = Duration(seconds: 5);
   static const int _heartbeatMissLimit = 2;
@@ -163,6 +162,7 @@ class SocketService {
   final Map<String, _ErrorLogState> _errorLog = {};
 
   StreamSubscription? _connectivitySubscription;
+  StreamSubscription? _serverDetailsSubscription;
   bool _networkAvailable = true;
   Timer? _connectivityReconnectTimer;
 
@@ -177,6 +177,10 @@ class SocketService {
     Logger.debug("Initializing socket service...");
     startSocket();
     _checkConnectivity();
+    // Whether the server acks heartbeats is only known once its details arrive, and changes with the server
+    _serverDetailsSubscription ??= SettingsSvc.serverDetailsChanges.listen((_) {
+      if (state.value == SocketState.connected) _startHeartbeat();
+    });
     Logger.debug("Initialized socket service");
   }
 
@@ -628,8 +632,10 @@ class SocketService {
 
   // ── Heartbeat ──────────────────────────────────────────────────────────────
 
+  @Deprecated('v1 servers only: v2 never acks client-sent events; remove with v1 support')
   void _startHeartbeat() {
     _stopHeartbeat();
+    if (!SettingsSvc.serverDetails.isV1Server) return;
     _heartbeatTimer = Timer.periodic(_heartbeatInterval, (_) => _sendHeartbeat());
   }
 
@@ -641,14 +647,20 @@ class SocketService {
     _heartbeatMisses = 0;
   }
 
-  /// Checks a "connected" socket now instead of waiting for the next heartbeat.
-  void checkConnection() => _sendHeartbeat();
+  /// Checks a "connected" socket now instead of waiting for the next heartbeat. Without one to ask (v2, or details not
+  /// fetched yet), it rebuilds: resume and network changes are when a dead socket goes unnoticed.
+  void checkConnection() {
+    if (SettingsSvc.serverDetails.isV1Server) return _sendHeartbeat();
+    if (socket != null && state.value == SocketState.connected) restartSocket();
+  }
 
   /// Rebuilds rather than calling `connect()`: socket.io still believes the dead
   /// connection is up.
+  @Deprecated('v1 servers only: v2 never acks client-sent events; remove with v1 support')
   void _sendHeartbeat() {
     final Socket? s = socket;
     if (s == null || state.value != SocketState.connected || _heartbeatTimeoutTimer != null) return;
+    if (!SettingsSvc.serverDetails.isV1Server) return;
 
     _heartbeatTimeoutTimer = Timer(_heartbeatTimeout, () {
       _heartbeatTimeoutTimer = null;
@@ -668,28 +680,6 @@ class SocketService {
       _heartbeatTimeoutTimer = null;
       _heartbeatMisses = 0;
     });
-  }
-
-  // ── Messaging ──────────────────────────────────────────────────────────────
-
-  Future<Map<String, dynamic>> sendMessage(String event, Map<String, dynamic> message) {
-    if (socket == null) return Future.error(StateError('Socket not connected'));
-    final completer = Completer<Map<String, dynamic>>();
-
-    socket!.emitWithAck(event, message, ack: (response) {
-      if (response['encrypted'] == true) {
-        response['data'] = jsonDecode(decryptAESCryptoJS(response['data'], password));
-      }
-
-      if (!completer.isCompleted) {
-        completer.complete(response);
-      }
-    });
-
-    return completer.future.timeout(
-      const Duration(seconds: 30),
-      onTimeout: () => Future.error(TimeoutException('Socket message timed out', const Duration(seconds: 30))),
-    );
   }
 
   // ── State reporting ────────────────────────────────────────────────────────
