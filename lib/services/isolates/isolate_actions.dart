@@ -125,6 +125,7 @@ class IsolateActons {
     IsolateRequestType.sendMultipartMessage: SendMessageActions.sendMultipartMessage,
     IsolateRequestType.sendAttachmentMessage: SendMessageActions.sendAttachmentMessage,
     IsolateRequestType.sendMultiAttachmentMessage: SendMessageActions.sendMultiAttachmentMessage,
+    IsolateRequestType.sendAppMessage: SendMessageActions.sendAppMessage,
 
     // CustomGroup
     IsolateRequestType.getAllCustomGroups: CustomGroupActions.getAllIds,
