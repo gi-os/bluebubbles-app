@@ -92,6 +92,7 @@ class ServerDetails {
 
   // v2 reports a 1.x feature level, which gates as usual. A 2.x would score 200 by the formula below, under several
   // 1.x thresholds
+  @Deprecated('v1-only: a 2.x scores under several 1.x thresholds. Gate new features on isV2Server')
   int get _featureCode =>
       isV2Server && (int.tryParse(serverVersion.split('.').first) ?? 0) >= 2 ? 1 << 30 : serverVersionCode;
 
@@ -156,8 +157,8 @@ class ServerDetails {
   /// Create new group chats via the Private API (v1.8.0).
   bool get supportsCreateGroupChat => _featureCode >= 268;
 
-  /// Several attachments in one message (`attachment/upload`, then `message/multipart`). Only tried against v2.
-  bool get supportsMultiAttachmentSend => isV2Server;
+  /// Several attachments in one message (v1.7.0).
+  bool get supportsMultiAttachmentSend => _featureCode >= 247;
 
   /// macOS version as a display string, e.g. "14.2".
   String get macOSVersionString => '$macOSVersion.$macOSMinorVersion';
