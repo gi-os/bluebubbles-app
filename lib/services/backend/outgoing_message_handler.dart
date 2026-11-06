@@ -975,13 +975,10 @@ class OutgoingMessageHandler {
 
     final missing = attachments.where((a) => !File(a.path).existsSync()).map((a) => a.path).toList();
     // A retry can come after the server or the Private API setting changed
-    final supported = SettingsSvc.serverDetails.supportsMultiAttachmentSend &&
-        SettingsSvc.settings.enablePrivateAPI.value &&
-        SettingsSvc.settings.privateAPIAttachmentSend.value;
     final unsendable = missing.isNotEmpty
         ? 'Attachment files not found: ${missing.join(', ')}'
-        : !supported
-            ? 'Sending several attachments as one message needs a v2 server and Private API attachment sending'
+        : !SettingsSvc.canSendAttachmentsTogether
+            ? 'Sending several attachments as one message needs server v1.7.0 or newer and Private API attachment sending'
             : null;
 
     void clearProgress() => attachmentProgress.removeWhere((e) => attachments.any((a) => a.guid == e.guid));
@@ -1025,8 +1022,9 @@ class OutgoingMessageHandler {
             Logger.warn('Failed to replace attachment $tempAttachmentGuid', error: e, trace: st, tag: _tag);
           }
         }
-        // The socket's copy can still match these; until then they'd show as sending forever
-        if (Get.isRegistered<MessagesService>(tag: c.guid)) {
+        // The socket's copy can still match these; until then they'd show as sending forever. A reply without
+        // attachments (the server stopped waiting for the row) says nothing about them, so the update matches them
+        if (responseAttachments.isNotEmpty && Get.isRegistered<MessagesService>(tag: c.guid)) {
           for (final a in unmatched) {
             MessagesSvc(c.guid).notifyAttachmentTransferError(tempGuid, a.guid!);
           }
