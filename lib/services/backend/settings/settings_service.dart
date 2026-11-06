@@ -328,7 +328,11 @@ class SettingsService {
   /// Returns the current cached [ServerDetails].
   ServerDetails get serverDetails => _serverDetails.value;
 
-  Stream<ServerDetails> get serverDetailsChanges => _serverDetails.stream;
+  /// Several attachments can go as one message: the server takes attachment parts, and they need the Private API.
+  bool get canSendAttachmentsTogether =>
+      serverDetails.supportsMultiAttachmentSend &&
+      settings.enablePrivateAPI.value &&
+      settings.privateAPIAttachmentSend.value;
 
   /// Group chats can be created on macOS <= Catalina or
   /// if the Private API is enabled, and the server supports it (v1.8.0).

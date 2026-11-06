@@ -148,7 +148,7 @@ class PinnedTileTextBubbleState extends CustomState<PinnedTileTextBubble, void, 
       final lastMessage = chatState.latestMessage.value;
       // The subtitle keeps a U+FFFC per Genmoji for the chat list, which this plain text can't draw
       final rawSubtitle = chatState.subtitle.value ?? '';
-      final subtitle = rawSubtitle.contains('￼') ? withoutInlineAttachments(rawSubtitle) : rawSubtitle;
+      final subtitle = rawSubtitle.contains(objectReplacementChar) ? withoutInlineAttachments(rawSubtitle) : rawSubtitle;
 
       final unread = chatState.hasUnreadMessage.value;
       // Null-safe isFromMe: treat null as false (unknown sender → show the bubble)
@@ -241,12 +241,16 @@ class PinnedTileTextBubbleState extends CustomState<PinnedTileTextBubble, void, 
     });
   }
 
+  /// [message]'s attachments to preview. Genmoji drawn inside the text read as that text, so they aren't any.
+  List<Attachment> _previewAttachments(Message message) {
+    final inline = message.inlineAttachmentGuids;
+    return AttachmentPreview.attachmentsFor(message, chatGuid: chat.guid)
+        .where((a) => !inline.contains(a.guid))
+        .toList();
+  }
+
   /// In-memory "1 Photo" text from [attachments] when the cached subtitle is
   /// the empty-relation fallback ("Attachment").
-  // A Genmoji message reads as its text, so its Genmoji aren't previews
-  List<Attachment> _previewAttachments(Message message) =>
-      message.inlineAttachments.isNotEmpty ? const [] : AttachmentPreview.attachmentsFor(message, chatGuid: chat.guid);
-
   String? _attachmentLabel(List<Attachment> attachments, Message? lastMessage) {
     if (attachments.isEmpty) return null;
     final msg = Message(

@@ -1,6 +1,7 @@
 import 'dart:convert';
 
 import 'package:bluebubbles/services/backend/settings/shared_preferences_service.dart';
+import 'package:bluebubbles/utils/logger/logger.dart';
 
 class ReplyToMessageState {
   final String messageGuid;
@@ -37,11 +38,15 @@ class SharedPreferencesMessagingActions {
         ..._tapbackEmojiUsage(_tapbackEmojiUsageKey).map((u) => u.emoji),
       }.toList();
 
-  /// Counts a use of [emoji] in [chatGuid] and overall. A full list drops its least used, longest unused emoji.
+  /// Counts a use of [emoji] in [chatGuid] and overall. A full list keeps [emoji] and drops the least used, longest
+  /// unused of the others.
   Future<void> addRecentTapbackEmoji(String emoji, {required String chatGuid}) =>
       _tapbackEmojiQueue = _tapbackEmojiQueue.then((_) async {
         await _countTapbackEmoji(_tapbackEmojiUsageKey, emoji, _tapbackEmojiLimit);
         await _countTapbackEmoji(_chatTapbackEmojiKey(chatGuid), emoji, _chatTapbackEmojiLimit);
+        // Caught so one failed write doesn't fail every count queued after it
+      }).catchError((Object e, StackTrace s) {
+        Logger.warn("Couldn't count tapback emoji $emoji", error: e, trace: s, tag: "TapbackEmoji");
       });
 
   // Each count reads, changes and rewrites a list, so overlapping ones would lose a use
@@ -54,15 +59,36 @@ class SharedPreferencesMessagingActions {
     if (getLastOpenedChat() == chatGuid) await clearLastOpenedChat();
   }
 
+  /// [clearChat] for every chat, deleted or not, found by key rather than by chat. Saved replies are cleared by
+  /// [clearAllReplyToMessageStates], in the GlobalIsolate.
+  Future<void> clearAllChats() async {
+    await _removeKeysStartingWith(['$_tapbackEmojiUsageKey:']);
+    await clearLastOpenedChat();
+  }
+
+  /// Every chat's saved reply. Run in the GlobalIsolate, whose prefs cache holds them (see PrefsInterface).
+  Future<void> clearAllReplyToMessageStates() =>
+      _removeKeysStartingWith(['${_replyToMessagePrefix}_', '${_replyToMessagePartPrefix}_']);
+
+  Future<void> _removeKeysStartingWith(List<String> prefixes) async {
+    final keys = service.i.keys.where((key) => prefixes.any(key.startsWith)).toList();
+    for (final key in keys) {
+      await service.i.remove(key);
+    }
+  }
+
   String _chatTapbackEmojiKey(String chatGuid) => '$_tapbackEmojiUsageKey:$chatGuid';
 
   Future<void> _countTapbackEmoji(String key, String emoji, int limit) async {
     final usage = _tapbackEmojiUsage(key);
     final index = usage.indexWhere((u) => u.emoji == emoji);
     final count = index == -1 ? 1 : usage.removeAt(index).count + 1;
-    usage.add((emoji: emoji, count: count, lastUsed: DateTime.now().millisecondsSinceEpoch));
-    _sortTapbackEmojiUsage(usage);
-    final kept = usage.take(limit).map((u) => {'e': u.emoji, 'n': u.count, 't': u.lastUsed}).toList();
+    // The one just used always stays: ranked with the rest, a new emoji (one use) would be the first dropped from a
+    // list that's full of emoji used more, so it could never get in
+    final kept = [
+      (emoji: emoji, count: count, lastUsed: DateTime.now().millisecondsSinceEpoch),
+      ...usage.take(limit - 1),
+    ].map((u) => {'e': u.emoji, 'n': u.count, 't': u.lastUsed}).toList();
     await service.i.setString(key, jsonEncode(kept));
   }
 

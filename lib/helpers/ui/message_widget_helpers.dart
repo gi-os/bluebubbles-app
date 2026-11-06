@@ -276,12 +276,12 @@ List<InlineSpan> _withInlineAttachments(List<InlineSpan> spans, MessagePart part
     part.hasInlineAttachments ? withInlineAttachments(spans, part.attachments, style) : spans;
 
 /// Swaps each U+FFFC in [spans] for the next of [inline] (Genmoji), drawn at text height.
-List<InlineSpan> withInlineAttachments(List<InlineSpan> spans, Iterable<Attachment> inline, TextStyle style) {
+List<InlineSpan> withInlineAttachments(List<InlineSpan> spans, Iterable<Attachment?> inline, TextStyle style) {
   final attachments = inline.iterator;
   final size = (style.fontSize ?? 14) * 1.25;
   return spans.expand<InlineSpan>((span) {
-    if (span is! TextSpan || !(span.text?.contains('\uFFFC') ?? false)) return [span];
-    final pieces = span.text!.split('\uFFFC');
+    if (span is! TextSpan || !(span.text?.contains(objectReplacementChar) ?? false)) return [span];
+    final pieces = span.text!.split(objectReplacementChar);
     return [
       for (int i = 0; i < pieces.length; i++) ...[
         if (i > 0)
