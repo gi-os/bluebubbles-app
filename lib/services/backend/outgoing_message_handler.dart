@@ -777,7 +777,7 @@ class OutgoingMessageHandler {
               effectId: m.expressiveSendStyleId,
               subject: m.subject,
               partIndex: int.tryParse(m.threadOriginatorPart?.split(':').firstOrNull ?? ''),
-              ddScan: _canScanLinks && m.text!.hasUrl,
+              ddScan: SettingsSvc.serverDetails.supportsLinkScan && m.text!.hasUrl,
             )
           : SendMessageInterface.sendTapback(
               chatGuid: c.guid,
@@ -859,7 +859,7 @@ class OutgoingMessageHandler {
         selectedMessageGuid: m.threadOriginatorGuid,
         effectId: m.expressiveSendStyleId,
         partIndex: int.tryParse(m.threadOriginatorPart?.split(':').firstOrNull ?? ''),
-        ddScan: _canScanLinks && parts.any((e) => e['text'].toString().hasUrl),
+        ddScan: SettingsSvc.serverDetails.supportsLinkScan && parts.any((e) => e['text'].toString().hasUrl),
       ),
       onSuccess: (data) => _finalizeOutgoingSuccess(c, tempGuid, data),
       onError: (error, stack) => _finalizeOutgoingFailure(
@@ -975,13 +975,10 @@ class OutgoingMessageHandler {
 
     final missing = attachments.where((a) => !File(a.path).existsSync()).map((a) => a.path).toList();
     // A retry can come after the server or the Private API setting changed
-    final supported = SettingsSvc.serverDetails.supportsMultiAttachmentSend &&
-        SettingsSvc.settings.enablePrivateAPI.value &&
-        SettingsSvc.settings.privateAPIAttachmentSend.value;
     final unsendable = missing.isNotEmpty
         ? 'Attachment files not found: ${missing.join(', ')}'
-        : !supported
-            ? 'Sending several attachments as one message needs a v2 server and Private API attachment sending'
+        : !SettingsSvc.canSendAttachmentsTogether
+            ? 'Sending several attachments as one message needs server v1.7.0 or newer and Private API attachment sending'
             : null;
 
     void clearProgress() => attachmentProgress.removeWhere((e) => attachments.any((a) => a.guid == e.guid));
@@ -1025,8 +1022,9 @@ class OutgoingMessageHandler {
             Logger.warn('Failed to replace attachment $tempAttachmentGuid', error: e, trace: st, tag: _tag);
           }
         }
-        // The socket's copy can still match these; until then they'd show as sending forever
-        if (Get.isRegistered<MessagesService>(tag: c.guid)) {
+        // The socket's copy can still match these; until then they'd show as sending forever. A reply without
+        // attachments (the server stopped waiting for the row) says nothing about them, so the update matches them
+        if (responseAttachments.isNotEmpty && Get.isRegistered<MessagesService>(tag: c.guid)) {
           for (final a in unmatched) {
             MessagesSvc(c.guid).notifyAttachmentTransferError(tempGuid, a.guid!);
           }
@@ -1315,7 +1313,4 @@ class OutgoingMessageHandler {
     if (!server.isV2Server || !server.isMinSequoia) return "Emoji tapbacks need a v2 server on macOS 15 or newer";
     return null;
   }
-
-  // 1.x's helper crashes Messages scanning on Sonoma and later (Apple Silicon); v2's sends unscanned if it can't scan
-  static bool get _canScanLinks => SettingsSvc.serverDetails.isV2Server || !SettingsSvc.serverDetails.isMinSonoma;
 }
