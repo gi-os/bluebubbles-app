@@ -96,7 +96,7 @@ class ServerDetails {
       isV2Server && (int.tryParse(serverVersion.split('.').first) ?? 0) >= 2 ? 1 << 30 : serverVersionCode;
 
   /// The v1 feature level for [serverVersion]: major * 100 + minor * 21 + patch, e.g. v1.6.0 → 226.
-  @Deprecated('v1-only: a 2.x scores under several 1.x thresholds. Gate new features on isV2Server')
+  /// v1-only: a 2.x scores under several 1.x thresholds, so gate new v2 features on [isV2Server].
   static int versionCodeFor(String serverVersion) {
     final v = Version.parse(serverVersion);
     return v.major * 100 + v.minor * 21 + v.patch;
@@ -166,6 +166,9 @@ class ServerDetails {
   /// Messages scanning on Sonoma and later (Apple Silicon). v2's is only measured on macOS 27; it guards the crash
   /// 1.x hit (the scan callback's argument order), sending unscanned instead, but 14 to 26 are untested
   bool get supportsLinkScan => isV2Server || !isMinSonoma;
+
+  /// Send emoji tapbacks (`reaction: "emoji"`): a v2 server on macOS Sequoia (15.0) or newer.
+  bool get supportsEmojiTapbacks => isV2Server && isMinSequoia;
 
   /// macOS version as a display string, e.g. "14.2".
   String get macOSVersionString => '$macOSVersion.$macOSMinorVersion';
