@@ -592,8 +592,9 @@ class IncomingMessageHandler {
   /// then assigns a real GUID.  This method resolves which local GUID to
   /// replace by index, using the following priority:
   ///
-  /// * If [existingGuid] starts with `temp-`, it was the attachment GUID
-  ///   (they are set equal at send time in `send_animation.dart`).
+  /// * If [existingGuid] starts with `temp-` and the message has one
+  ///   attachment, it was the attachment GUID (they are set equal at send time
+  ///   in `send_animation.dart`).
   /// * Otherwise look up the DB GUID via [existing.dbAttachments] by index —
   ///   this handles socket events that omit `tempGuid` (e.g. keyboard GIFs).
   ///
@@ -609,14 +610,25 @@ class IncomingMessageHandler {
     Message replacement,
     List<Attachment?> replacementAttachments,
   ) async {
+    final unmatched = existing.dbAttachments.toList();
     for (int i = 0; i < replacementAttachments.length; i++) {
       final newAttachment = replacementAttachments[i];
       if (newAttachment == null) continue;
 
       // Resolve which local GUID currently owns this attachment slot.
       final String attachmentExistingGuid;
-      if (existingGuid.startsWith('temp-')) {
+      if (existingGuid.startsWith('temp-') && existing.dbAttachments.length <= 1) {
         attachmentExistingGuid = existingGuid;
+      } else if (existingGuid.startsWith('temp-')) {
+        // Multi-attachment send: match each temp attachment by message part, then name, then position
+        final partGuid = OutgoingMultiAttachment.sentTempGuid(existingGuid, replacement, newAttachment);
+        final match = unmatched.firstWhereOrNull((a) => partGuid != null && a.guid == partGuid) ??
+            unmatched.firstWhereOrNull((a) => a.transferName == newAttachment.transferName) ??
+            unmatched.firstOrNull;
+        // No attachment carries the message's temp GUID in a multi-attachment send, so there's nothing to replace
+        if (match == null) continue;
+        unmatched.remove(match);
+        attachmentExistingGuid = match.guid!;
       } else if (existing.dbAttachments.isNotEmpty && i < existing.dbAttachments.length) {
         attachmentExistingGuid = existing.dbAttachments[i].guid ?? existingGuid;
       } else {
