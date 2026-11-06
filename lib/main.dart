@@ -394,7 +394,15 @@ class Main extends StatelessWidget {
           LogicalKeySet(LogicalKeyboardKey.control, LogicalKeyboardKey.keyI): const OpenChatDetailsIntent(),
           LogicalKeySet(LogicalKeyboardKey.escape): const GoBackIntent(),
         },
-        builder: (context, child) => SafeArea(
+        // A route only reports its own pop state, so a pushed page could tell Android nothing handles back and the
+        // gesture left the app. Back always goes through Flutter instead, which still exits when nothing can pop.
+        builder: (context, child) => NotificationListener<NavigationNotification>(
+          onNotification: (notification) {
+            if (notification.canHandlePop) return false;
+            const NavigationNotification(canHandlePop: true).dispatch(context);
+            return true;
+          },
+          child: SafeArea(
           top: false,
           bottom: false,
           // secure_application has no Linux implementation; mounting it (and the
@@ -494,6 +502,7 @@ class Main extends StatelessWidget {
                     },
                   ),
                 ),
+          ),
         ),
         defaultTransition: Transition.cupertino,
       ),
