@@ -5,8 +5,10 @@ import 'package:bluebubbles/database/models.dart' hide PayloadType;
 import 'package:bluebubbles/helpers/helpers.dart';
 import 'package:bluebubbles/services/services.dart';
 import 'package:bluebubbles/utils/logger/logger.dart';
+import 'package:dio/dio.dart' as dio;
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
+import 'package:flutter_image_compress/flutter_image_compress.dart';
 import 'package:get/get.dart';
 import 'package:universal_io/io.dart';
 import 'package:url_launcher/url_launcher.dart';
@@ -31,7 +33,7 @@ class OpenPigeon {
   /// Where the server says a subscription can be bought.
   static String? purchaseUrl;
   static final Map<String, Future<Map<String, dynamic>?>> _payloads = {};
-  static ValueChanged<Map<String, dynamic>>? _onKeyboardMessage;
+  static ({String chatGuid, ValueChanged<Map<String, dynamic>> callback})? _keyboard;
 
   /// Platform views OpenPigeon failed to fill, which show our own fallback instead.
   static final RxSet<int> failedViews = <int>{}.obs;
@@ -49,13 +51,21 @@ class OpenPigeon {
   /// OpenPigeon can draw games: it's installed and the server hands out their payloads.
   static bool get canDraw => _onV2 && licensed.value && installed.value;
 
+  /// Snapshots by message guid, least recently used first (a Dart map keeps insertion order), capped at
+  /// [_maxSnapshots] so scrolling a long chat doesn't keep every PNG.
   static final Map<String, Future<Uint8List?>> _snapshots = {};
+  static const _maxSnapshots = 50;
 
   /// A still of [message]'s game as OpenPigeon draws it, [width] logical pixels wide and as tall as its layout (up to
-  /// [maxHeight]), for the turns GamePigeon sends without an image. Null when OpenPigeon can't draw it; a failure is retried the next time it's asked for.
+  /// [maxHeight]), for the turns GamePigeon sends without an image. Null when OpenPigeon can't draw it; a failure is
+  /// retried the next time it's asked for.
   static Future<Uint8List?> snapshot(Message message, Chat chat, double width, double maxHeight) {
     final guid = message.guid!;
-    return _snapshots[guid] ??= payloadFor(message).then((payload) async {
+    final cached = _snapshots.remove(guid);
+    if (cached != null) return _snapshots[guid] = cached;
+
+    late final Future<Uint8List?> drawing;
+    drawing = payloadFor(message).then((payload) async {
       if (payload == null) return null;
       try {
         return await _channel.invokeMethod<Uint8List>('snapshot', {
@@ -70,9 +80,15 @@ class OpenPigeon {
         return null;
       }
     }).then((png) {
-      if (png == null) _snapshots.remove(guid);
+      // Only this attempt's own entry: it may have been evicted and asked for again since
+      if (png == null && identical(_snapshots[guid], drawing)) _snapshots.remove(guid);
       return png;
     });
+    _snapshots[guid] = drawing;
+    while (_snapshots.length > _maxSnapshots) {
+      _snapshots.remove(_snapshots.keys.first);
+    }
+    return drawing;
   }
 
   /// Sessions opened in OpenPigeon this run. Bubbles are drawn from the sender's image, so OpenPigeon only hears
@@ -113,8 +129,27 @@ class OpenPigeon {
       licensed.value = false;
       return;
     }
+    final dio.Response response;
     try {
-      final data = (await HttpSvc.server.subscription()).data['data'] as Map<String, dynamic>;
+      response = await HttpSvc.server.subscription();
+    } catch (e) {
+      // A 4xx is the server's answer. Anything else (a timeout, no connection, a 5xx) says nothing about the license,
+      // so the last answer stands rather than locking games every time a resume beats the network
+      final status = switch (e) {
+        dio.Response() => e.statusCode,
+        dio.DioException() => e.response?.statusCode,
+        _ => null,
+      };
+      if (status != null && status >= 400 && status < 500) {
+        Logger.warn('The server refused the subscription check ($status)', tag: 'OpenPigeon');
+        licensed.value = false;
+      } else {
+        Logger.warn('Could not check the server subscription', error: e, tag: 'OpenPigeon');
+      }
+      return;
+    }
+    try {
+      final data = response.data['data'] as Map<String, dynamic>;
       final tiers = (data['available_tiers'] as List? ?? const []).whereType<Map>().toList();
       final pro = tiers.firstWhereOrNull((t) => t['id'] == 'pro');
       final held = tiers.firstWhereOrNull((t) => t['id'] == data['tier']);
@@ -124,8 +159,8 @@ class OpenPigeon {
       licensed.value = data['tier'] != null &&
           (held == null || pro == null || (held['rank'] as int) >= (pro['rank'] as int));
     } catch (e) {
-      Logger.warn('Could not check the server subscription', error: e, tag: 'OpenPigeon');
-      licensed.value = false;
+      // A reply this build can't read isn't an answer either
+      Logger.warn('Could not read the server subscription', error: e, tag: 'OpenPigeon');
     }
   }
 
@@ -140,11 +175,13 @@ class OpenPigeon {
     final guid = message.guid!;
     final app = message.payloadData?.appData?.firstOrNull;
     if (app?.url != null && app?.sessionId != null) {
-      return Future.value(_madrid(guid, app!.url, app.sessionId, app.ldText, app.userInfo?.caption));
+      return Future.value(
+          _madrid(guid, message.balloonBundleId, app!.url, app.sessionId, app.ldText, app.userInfo?.caption));
     }
     return _payloads[guid] ??= HttpSvc.message.getAppMessage(guid).then<Map<String, dynamic>?>((response) {
       final data = response.data['data'] as Map<String, dynamic>;
-      return _madrid(guid, data['url'], data['session_id'], data['summary'], data['caption']);
+      return _madrid(
+          guid, message.balloonBundleId, data['url'], data['session_id'], data['summary'], data['caption']);
     }).catchError((Object e) {
       Logger.warn('Could not load OpenPigeon payload for $guid', error: e, tag: 'OpenPigeon');
       _payloads.remove(guid);
@@ -155,8 +192,15 @@ class OpenPigeon {
   /// Number of people in [chat], counting the user, which OpenPigeon uses to hide games.
   static int userCount(Chat chat) => chat.isGroup ? chat.handles.length + 1 : 2;
 
-  /// Set by the game picker sheet: a picked game goes to the composer rather than straight out.
-  static void onKeyboardMessage(ValueChanged<Map<String, dynamic>>? callback) => _onKeyboardMessage = callback;
+  /// Set by the game picker for [chatGuid]: a game picked there goes to its composer rather than straight out.
+  static void onKeyboardMessage(String chatGuid, ValueChanged<Map<String, dynamic>> callback) =>
+      _keyboard = (chatGuid: chatGuid, callback: callback);
+
+  /// Clears [callback], unless a newer picker has already replaced it.
+  static void clearKeyboardMessage(ValueChanged<Map<String, dynamic>> callback) {
+    // Tear-offs of one object's method are equal, not identical
+    if (_keyboard?.callback == callback) _keyboard = null;
+  }
 
   static Future<bool> _handle(MethodCall call) async {
     final args = call.arguments is Map ? (call.arguments as Map).cast<String, dynamic>() : <String, dynamic>{};
@@ -171,7 +215,13 @@ class OpenPigeon {
       return false;
     }
     if (args['fromKeyboard'] == true) {
-      _onKeyboardMessage?.call(args);
+      // A late pick from a picker since closed must not land in another chat's composer
+      final keyboard = _keyboard;
+      if (keyboard == null || keyboard.chatGuid != args['chatGuid']) {
+        Logger.warn('Ignoring a game picked in a chat whose picker is closed', tag: 'OpenPigeon');
+        return false;
+      }
+      keyboard.callback(args);
       return true;
     }
     final chat = Chat.findOne(guid: args['chatGuid'] as String);
@@ -179,8 +229,7 @@ class OpenPigeon {
       Logger.warn("Ignoring an OpenPigeon turn for a chat that isn't saved", tag: 'OpenPigeon');
       return false;
     }
-    await sendGame(chat, args);
-    return true;
+    return await sendGame(chat, args);
   }
 
   /// Opens the game [payload] (from [payloadFor]) belongs to.
@@ -196,25 +245,65 @@ class OpenPigeon {
   }
 
   /// Queues an OpenPigeon message ([game] holds its `url`, `session`, `ldText`, `caption` and `imageBase64`) in
-  /// [chat], drawn at once like any other send.
-  static Future<void> sendGame(Chat chat, Map<String, dynamic> game) async {
+  /// [chat], drawn at once like any other send. False, after telling the user, when its picture is one the server
+  /// would refuse, so it isn't queued only to fail on every retry.
+  static Future<bool> sendGame(Chat chat, Map<String, dynamic> game) async {
+    var image = gameImage(game);
+    if (image != null && image.length > _maxImageBytes) image = await _shrink(image);
+    final type = image == null ? null : _imageType(image);
+    if (image != null && (type == null || image.length > _maxImageBytes)) {
+      Logger.warn("Not sending a game whose picture the server won't take (${image.length} bytes)",
+          tag: 'OpenPigeon');
+      showSnackbar("Error", "This game's picture can't be sent", type: SnackbarType.error);
+      return false;
+    }
     final message = gameMessage(game)..generateTempGuid();
-    final image = gameImage(game);
     await OutgoingMsgHandler.queue(OutgoingAppMessage(
       chat: chat,
       message: message,
-      attachment: image == null
+      attachment: image == null || type == null
           ? null
           : Attachment(
               guid: message.guid,
               isOutgoing: true,
-              mimeType: 'image/jpeg',
-              uti: 'public.jpeg',
-              transferName: 'game.jpg',
+              mimeType: type.mimeType,
+              uti: type.uti,
+              transferName: 'game.${type.extension}',
               totalBytes: image.length,
               bytes: image,
             ),
     ));
+    return true;
+  }
+
+  /// The most a balloon's picture may be, as the server caps it (`AppPreviewImage.maximumBytes`).
+  static const _maxImageBytes = 4 * 1024 * 1024;
+
+  /// [image] re-encoded as a smaller JPEG, or unchanged if it can't be.
+  static Future<Uint8List> _shrink(Uint8List image) async {
+    try {
+      return await FlutterImageCompress.compressWithList(image, minWidth: 1280, minHeight: 1280, quality: 80);
+    } catch (e) {
+      Logger.warn('Could not shrink a game picture', error: e, tag: 'OpenPigeon');
+      return image;
+    }
+  }
+
+  /// [bytes]' type, read from the bytes themselves as the server does: JPEG, PNG or HEIC, the three it accepts.
+  static ({String mimeType, String uti, String extension})? _imageType(Uint8List bytes) {
+    bool startsWith(List<int> magic, [int offset = 0]) =>
+        bytes.length >= offset + magic.length && magic.indexed.every((e) => bytes[offset + e.$1] == e.$2);
+    if (startsWith(const [0xFF, 0xD8, 0xFF])) return (mimeType: 'image/jpeg', uti: 'public.jpeg', extension: 'jpg');
+    if (startsWith(const [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A])) {
+      return (mimeType: 'image/png', uti: 'public.png', extension: 'png');
+    }
+    // An ISO base-media `ftyp` box naming a HEIF brand
+    if (bytes.length >= 12 &&
+        startsWith(ascii.encode('ftyp'), 4) &&
+        const ['heic', 'heix', 'hevc', 'hevx', 'mif1', 'msf1'].contains(String.fromCharCodes(bytes.sublist(8, 12)))) {
+      return (mimeType: 'image/heic', uti: 'public.heic', extension: 'heic');
+    }
+    return null;
   }
 
   /// The message [game] becomes once sent, so it can be drawn the same way before then.
@@ -223,7 +312,7 @@ class OpenPigeon {
         dateCreated: DateTime.now(),
         isFromMe: true,
         handleId: 0,
-        balloonBundleId: balloonBundleId,
+        balloonBundleId: _gameBundleId(game['balloonBundleId']),
         hasAttachments: gameImage(game) != null,
         payloadData: PayloadData(type: PayloadType.app, appData: [
           iMessageAppData(
@@ -235,6 +324,13 @@ class OpenPigeon {
           ),
         ]),
       );
+
+  /// The extension's own part of [balloonBundleId], the same whichever developer team id precedes it.
+  static final _extensionSuffix = balloonBundleId.substring(balloonBundleId.lastIndexOf(':'));
+
+  /// The balloon id a turn goes out under: the one its game was opened from, so the server threads it into that
+  /// session (it matches the id exactly), or GamePigeon's current one for a new game.
+  static String _gameBundleId(Object? id) => id is String && id.endsWith(_extensionSuffix) ? id : balloonBundleId;
 
   /// The picture OpenPigeon drew for [game], if it sent one.
   static Uint8List? gameImage(Map<String, dynamic> game) {
@@ -255,10 +351,21 @@ class OpenPigeon {
 
   /// Session ids are lowercased because OpenPigeon matches them exactly and makes its own lowercase, while the
   /// server reports `NSUUID`'s uppercase.
-  static Map<String, dynamic>? _madrid(String guid, Object? url, Object? session, Object? ldText, Object? caption) {
+  ///
+  /// `balloonBundleId` isn't a Madrid field: it rides along so a game opened from [guid] sends its turns under the id
+  /// its session started with.
+  static Map<String, dynamic>? _madrid(
+    String guid,
+    String? bundleId,
+    Object? url,
+    Object? session,
+    Object? ldText,
+    Object? caption,
+  ) {
     if (url is! String || url.isEmpty) return null;
     return {
       'messageGuid': guid,
+      'balloonBundleId': bundleId,
       'url': url,
       'session': _string(session)?.toLowerCase(),
       'ldText': _string(ldText),

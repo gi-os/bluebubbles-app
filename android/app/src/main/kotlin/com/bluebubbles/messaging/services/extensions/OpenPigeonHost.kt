@@ -30,9 +30,13 @@ import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.TimeoutCancellationException
+import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
 import java.io.ByteArrayOutputStream
+import java.util.concurrent.Executors
 
 /// Host side of the Madrid extension interface, for OpenPigeon (com.openbubbles.openpigeon).
 /// OpenPigeon supplies RemoteViews for the game picker, and opens a game when its bubble is tapped; turns it
@@ -42,10 +46,15 @@ object OpenPigeonHost {
     private const val SERVICE = "$PACKAGE.MadridExtensionService"
     private const val TAG = "OpenPigeonHost"
 
-    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    /// One thread, so calls reach OpenPigeon in the order they were made: a picker closed and reopened must not have
+    /// its keyboardClosed land after the new keyboardOpened.
+    private val scope = CoroutineScope(
+        SupervisorJob() + Executors.newSingleThreadExecutor { Thread(it, TAG) }.asCoroutineDispatcher(),
+    )
     private val main = Handler(Looper.getMainLooper())
     @Volatile private var channel: MethodChannel? = null
     private var extension: CompletableDeferred<IMadridExtension>? = null
+    private var connection: ServiceConnection? = null
 
     /// Picker views on screen, which are loaded again if OpenPigeon's process dies, since their sessions die with it.
     /// Main thread only.
@@ -65,24 +74,33 @@ object OpenPigeonHost {
                     "open" -> {
                         val args = call.arguments as? Map<*, *> ?: emptyMap<Any, Any>()
                         val message = madridMessage(args)
-                        val handle = messageHandle(args["chatGuid"] as? String ?: "")
+                        val handle = messageHandle(args["chatGuid"] as? String ?: "", args["balloonBundleId"] as? String)
                         val userCount = (args["userCount"] as? Number)?.toInt() ?: 2
-                        withExtension(app) { it.didTapTemplate(message, handle, userCount) }
-                        result.success(null)
+                        // Answered once OpenPigeon has taken it, so Dart can say when the game didn't open
+                        withExtension(app, {
+                            main.post { result.error("unavailable", "OpenPigeon couldn't open the game", null) }
+                        }) {
+                            it.didTapTemplate(message, handle, userCount)
+                            main.post { result.success(null) }
+                        }
                     }
                     // A still of a game's live view, for turns that carry no image of their own. Width and maxHeight
                     // are logical pixels; the reply is PNG bytes, or null.
                     "snapshot" -> {
                         val args = call.arguments as? Map<*, *> ?: emptyMap<Any, Any>()
                         val message = madridMessage(args)
-                        val handle = messageHandle(args["chatGuid"] as? String ?: "")
                         val userCount = (args["userCount"] as? Number)?.toInt() ?: 2
                         val density = app.resources.displayMetrics.density
                         val width = ((args["width"] as? Number)?.toDouble() ?: 0.0).times(density).toInt()
                         val maxHeight = ((args["maxHeight"] as? Number)?.toDouble() ?: 0.0).times(density).toInt()
                         withExtension(app, { main.post { result.success(null) } }) {
-                            val views = it.getLiveView(ignoredViewUpdates, message, handle, userCount)
-                            main.post { result.success(views?.let { v -> render(app, v, width, maxHeight) }) }
+                            val views = it.getLiveView(ignoredViewUpdates, message, inertHandle, userCount)
+                            // Views are built on the main thread; the PNG is encoded off it
+                            val bitmap = views?.let { v ->
+                                withContext(Dispatchers.Main) { draw(app, v, width, maxHeight) }
+                            }
+                            val png = bitmap?.let { b -> withContext(Dispatchers.Default) { encode(b) } }
+                            main.post { result.success(png) }
                         }
                     }
                     else -> result.notImplemented()
@@ -97,9 +115,21 @@ object OpenPigeonHost {
         override fun updateView(views: RemoteViews?) {}
     }
 
-    /// Lays [views] out off screen [width] pixels wide and draws them into a PNG. The height is the layout's own, up to
-    /// [maxHeight], so the bubble keeps the shape OpenPigeon draws.
-    private fun render(context: Context, views: RemoteViews, width: Int, maxHeight: Int): ByteArray? {
+    /// The handle a snapshot's live view gets. Drawing a bubble is not the user playing, so nothing sent through it
+    /// goes out; only a game the user opened gets a handle that sends.
+    private val inertHandle = object : IMessageViewHandle.Stub() {
+        override fun updateMessage(message: MadridMessage?, callback: ITaskCompleteCallback?) {
+            Log.w(TAG, "Ignoring a message sent from a snapshot's view")
+        }
+
+        override fun setSuppressNotifications(suppress: Boolean) {}
+        override fun lock() {}
+        override fun unlock() {}
+    }
+
+    /// Lays [views] out off screen [width] pixels wide and draws them. The height is the layout's own, up to
+    /// [maxHeight], so the bubble keeps the shape OpenPigeon draws. Main thread only.
+    private fun draw(context: Context, views: RemoteViews, width: Int, maxHeight: Int): Bitmap? {
         if (width <= 0 || maxHeight <= 0) return null
         return try {
             val view = views.apply(context, FrameLayout(context))
@@ -108,13 +138,24 @@ object OpenPigeonHost {
                 View.MeasureSpec.makeMeasureSpec(maxHeight, View.MeasureSpec.AT_MOST),
             )
             view.layout(0, 0, view.measuredWidth, view.measuredHeight)
-            val bitmap = Bitmap.createBitmap(view.measuredWidth, view.measuredHeight, Bitmap.Config.ARGB_8888)
-            view.draw(Canvas(bitmap))
-            ByteArrayOutputStream().also { bitmap.compress(Bitmap.CompressFormat.PNG, 100, it) }.toByteArray()
+            if (view.measuredWidth <= 0 || view.measuredHeight <= 0) return null
+            Bitmap.createBitmap(view.measuredWidth, view.measuredHeight, Bitmap.Config.ARGB_8888).also {
+                view.draw(Canvas(it))
+            }
         } catch (e: Exception) {
             Log.e(TAG, "Rendering an OpenPigeon view failed", e)
             null
         }
+    }
+
+    /// [bitmap] as PNG bytes, which then frees it.
+    private fun encode(bitmap: Bitmap): ByteArray? = try {
+        ByteArrayOutputStream().also { bitmap.compress(Bitmap.CompressFormat.PNG, 100, it) }.toByteArray()
+    } catch (e: Exception) {
+        Log.e(TAG, "Encoding an OpenPigeon view failed", e)
+        null
+    } finally {
+        bitmap.recycle()
     }
 
     private fun isInstalled(context: Context): Boolean = try {
@@ -129,7 +170,6 @@ object OpenPigeonHost {
     private fun connect(context: Context): CompletableDeferred<IMadridExtension> = synchronized(this) {
         extension?.let { return it }
         val deferred = CompletableDeferred<IMadridExtension>()
-        extension = deferred
         val connection = object : ServiceConnection {
             override fun onServiceConnected(name: ComponentName?, binder: IBinder) {
                 deferred.complete(IMadridExtension.Stub.asInterface(binder))
@@ -140,13 +180,12 @@ object OpenPigeonHost {
             override fun onNullBinding(name: ComponentName?) = drop(reload = false)
 
             private fun drop(reload: Boolean) {
-                reset(deferred)
-                try {
-                    context.unbindService(this)
-                } catch (_: IllegalArgumentException) {}
+                reset(context, deferred)
                 if (reload) main.postDelayed({ views.toList().forEach { it.load() } }, 1_000)
             }
         }
+        extension = deferred
+        this.connection = connection
         // Tapping a game makes OpenPigeon open its own activity, which Android 14+ blocks from a background app unless
         // the visible app that bound it allows it
         val flags = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
@@ -154,21 +193,47 @@ object OpenPigeonHost {
         } else {
             Context.BIND_AUTO_CREATE
         }
-        val bound = context.bindService(Intent().setClassName(PACKAGE, SERVICE), connection, flags)
-        if (!bound) reset(deferred)
+        val bound = try {
+            context.bindService(Intent().setClassName(PACKAGE, SERVICE), connection, flags)
+        } catch (e: SecurityException) {
+            Log.e(TAG, "Binding OpenPigeon was refused", e)
+            false
+        }
+        if (!bound) reset(context, deferred)
         deferred
     }
 
-    private fun reset(deferred: CompletableDeferred<IMadridExtension>) {
-        synchronized(this) { if (extension === deferred) extension = null }
+    /// Fails [deferred] and, if it is still the current binding, forgets and unbinds it so the next call binds afresh.
+    /// A binding that never connects is reset the same way, or every later call would wait on it.
+    private fun reset(context: Context, deferred: CompletableDeferred<IMadridExtension>) {
+        val stale = synchronized(this) {
+            if (extension !== deferred) {
+                null
+            } else {
+                extension = null
+                connection.also { connection = null }
+            }
+        }
         deferred.completeExceptionally(IllegalStateException("OpenPigeon disconnected"))
+        if (stale != null) {
+            try {
+                context.unbindService(stale)
+            } catch (_: IllegalArgumentException) {}
+        }
     }
 
     // OpenPigeon is a separate app that can change under us, so anything it does wrong is logged, never thrown
-    private fun withExtension(context: Context, onError: () -> Unit = {}, block: (IMadridExtension) -> Unit) =
+    private fun withExtension(context: Context, onError: () -> Unit = {}, block: suspend (IMadridExtension) -> Unit) =
         scope.launch {
             try {
-                block(withTimeout(10_000) { connect(context).await() })
+                val deferred = connect(context)
+                val ext = try {
+                    withTimeout(10_000) { deferred.await() }
+                } catch (e: TimeoutCancellationException) {
+                    reset(context, deferred)
+                    throw e
+                }
+                block(ext)
             } catch (e: Exception) {
                 Log.e(TAG, "OpenPigeon call failed", e)
                 onError()
@@ -177,11 +242,18 @@ object OpenPigeonHost {
 
     // Needs the activity's Dart engine alive; a turn played after the app was killed is left
     // to OpenPigeon's own retry.
-    private fun send(chatGuid: String, message: MadridMessage, fromKeyboard: Boolean, done: () -> Unit = {}) {
+    private fun send(
+        chatGuid: String,
+        message: MadridMessage,
+        fromKeyboard: Boolean,
+        balloonBundleId: String? = null,
+        done: () -> Unit = {},
+    ) {
         main.post {
             val args = mapOf(
                 "chatGuid" to chatGuid,
                 "fromKeyboard" to fromKeyboard,
+                "balloonBundleId" to balloonBundleId,
                 "url" to message.url,
                 "session" to message.session,
                 "ldText" to message.ldText,
@@ -189,8 +261,13 @@ object OpenPigeonHost {
                 "imageBase64" to message.imageBase64,
             )
             channel?.invokeMethod("send", args, object : MethodChannel.Result {
+                // Dart answers false for a message it dropped, which OpenPigeon must not be told was sent
                 override fun success(result: Any?) {
-                    scope.launch { done() }
+                    if (result == true) {
+                        scope.launch { done() }
+                    } else {
+                        Log.w(TAG, "Dart did not take the OpenPigeon message")
+                    }
                 }
 
                 override fun error(code: String, msg: String?, details: Any?) {
@@ -204,10 +281,11 @@ object OpenPigeonHost {
 
     /// Where OpenPigeon sends a game's turns. It keeps the handle on its session and uses it from the game activity,
     /// so it can't depend on any view.
-    private fun messageHandle(chatGuid: String) = object : IMessageViewHandle.Stub() {
+    /// [balloonBundleId] is the opened game's own, so its turns go out under the id the session was started with.
+    private fun messageHandle(chatGuid: String, balloonBundleId: String?) = object : IMessageViewHandle.Stub() {
         override fun updateMessage(message: MadridMessage?, callback: ITaskCompleteCallback?) {
             if (message == null) return
-            send(chatGuid, message, fromKeyboard = false) {
+            send(chatGuid, message, fromKeyboard = false, balloonBundleId = balloonBundleId) {
                 try {
                     callback?.complete()
                 } catch (e: Exception) {
